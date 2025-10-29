@@ -173,12 +173,8 @@ jobs:
               ;;
           esac
           
-          # 创建提交信息
-          COMMIT_MESSAGE="🔄 自动更新 Worker
-版本: $TARGET_TAG
-类型: $COMMIT_TYPE"
-          
-          # 设置输出 - 使用单行方式
+          # 使用单行提交信息避免语法问题
+          COMMIT_MESSAGE="🔄 自动更新 Worker - 版本: $TARGET_TAG - 类型: $COMMIT_TYPE"
           echo "commit_message=$COMMIT_MESSAGE" >> $GITHUB_OUTPUT
 
       - name: 执行更新
