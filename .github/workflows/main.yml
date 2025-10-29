@@ -173,10 +173,14 @@ jobs:
               ;;
           esac
           
-          # 使用GITHUB_OUTPUT设置输出
-          echo "commit_message=🔄 自动更新 Worker
+          # 创建多行提交信息
+          COMMIT_MESSAGE="🔄 自动更新 Worker
 版本: $TARGET_TAG
-类型: $COMMIT_TYPE" >> $GITHUB_OUTPUT
+类型: $COMMIT_TYPE"
+          
+          echo "commit_message<<EOF" >> $GITHUB_OUTPUT
+          echo "$COMMIT_MESSAGE" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
 
       - name: 执行更新
         if: env.UPDATE_NEEDED == 'true'
