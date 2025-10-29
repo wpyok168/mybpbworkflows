@@ -24,14 +24,15 @@ jobs:
         uses: actions/checkout@v4
 
       - name: 获取当前本地版本
-        id: get_local_version
+        id: local_version
         run: |
           if [ -f version.txt ]; then
             LOCAL_VERSION=$(cat version.txt)
+            echo "LOCAL_VERSION=$LOCAL_VERSION" >> $GITHUB_ENV
           else
-            LOCAL_VERSION="v0.0.0"
+            echo "LOCAL_VERSION=v0.0.0" >> $GITHUB_ENV
           fi
-          echo "LOCAL_VERSION=$LOCAL_VERSION" >> $GITHUB_ENV
+          echo "当前本地版本: $LOCAL_VERSION"
 
       - name: 获取所有发布版本信息
         id: get_releases
@@ -39,137 +40,161 @@ jobs:
           API_URL="https://api.github.com/repos/bia-pain-bache/BPB-Worker-Panel/releases"
           RESPONSE=$(curl -s "$API_URL")
           
+          # 调试输出
+          echo "API响应:"
+          echo "$RESPONSE" | jq .[] | head -20
+          
           # 获取最新正式版
-          LATEST_RELEASE=$(echo "$RESPONSE" | jq -r '[.[] | select(.prerelease==false)][0]')
-          LATEST_TAG=$(echo "$LATEST_RELEASE" | jq -r '.tag_name // ""')
-          LATEST_DOWNLOAD=$(echo "$LATEST_RELEASE" | jq -r '.assets[] | select(.name=="worker.zip") | .browser_download_url // ""')
+          LATEST_RELEASE=$(echo "$RESPONSE" | jq -r '[.[] | select(.prerelease==false)][0] // "null"')
+          if [ "$LATEST_RELEASE" != "null" ]; then
+            LATEST_TAG=$(echo "$LATEST_RELEASE" | jq -r '.tag_name // ""')
+            LATEST_DOWNLOAD=$(echo "$LATEST_RELEASE" | jq -r '.assets[]? | select(.name=="worker.zip") | .browser_download_url // ""')
+          else
+            LATEST_TAG=""
+            LATEST_DOWNLOAD=""
+          fi
           
           # 获取最新Pre-release
-          PRE_RELEASE=$(echo "$RESPONSE" | jq -r '[.[] | select(.prerelease==true)][0]')
-          PRE_TAG=$(echo "$PRE_RELEASE" | jq -r '.tag_name // ""')
-          PRE_DOWNLOAD=$(echo "$PRE_RELEASE" | jq -r '.assets[] | select(.name=="worker.zip") | .browser_download_url // ""')
+          PRE_RELEASE=$(echo "$RESPONSE" | jq -r '[.[] | select(.prerelease==true)][0] // "null"')
+          if [ "$PRE_RELEASE" != "null" ]; then
+            PRE_TAG=$(echo "$PRE_RELEASE" | jq -r '.tag_name // ""')
+            PRE_DOWNLOAD=$(echo "$PRE_RELEASE" | jq -r '.assets[]? | select(.name=="worker.zip") | .browser_download_url // ""')
+          else
+            PRE_TAG=""
+            PRE_DOWNLOAD=""
+          fi
           
           echo "LATEST_TAG=$LATEST_TAG" >> $GITHUB_ENV
           echo "LATEST_DOWNLOAD=$LATEST_DOWNLOAD" >> $GITHUB_ENV
           echo "PRE_TAG=$PRE_TAG" >> $GITHUB_ENV
           echo "PRE_DOWNLOAD=$PRE_DOWNLOAD" >> $GITHUB_ENV
           
-          echo "当前本地版本: $LOCAL_VERSION"
           echo "最新正式版: $LATEST_TAG"
           echo "最新Pre-release: $PRE_TAG"
 
       - name: 版本比较和选择更新目标
         id: select_target
         run: |
-          # 函数：比较版本号 (返回: 0=相等, 1=版本1>版本2, 2=版本1<版本2)
+          # 简化版本比较函数
           compare_versions() {
             if [ "$1" = "$2" ]; then
               return 0
             fi
             
-            # 提取纯数字版本号进行比较
-            v1=$(echo "$1" | sed 's/^v//' | sed 's/-.*//')
-            v2=$(echo "$2" | sed 's/^v//' | sed 's/-.*//')
-            
-            IFS='.' read -r -a v1_parts <<< "$v1"
-            IFS='.' read -r -a v2_parts <<< "$v2"
-            
-            for i in {0..2}; do
-              num1=${v1_parts[i]:=0}
-              num2=${v2_parts[i]:=0}
-              
-              if [ "$num1" -gt "$num2" ]; then
-                return 1
-              elif [ "$num1" -lt "$num2" ]; then
-                return 2
-              fi
-            done
-            
-            # 如果数字部分相同，比较完整字符串
-            if [[ "$1" > "$2" ]]; then
+            # 使用sort进行版本比较
+            higher_version=$(echo -e "$1\n$2" | sed 's/^v//' | sort -V -r | head -n1 | sed 's/^/v/')
+            if [ "$1" = "$higher_version" ]; then
               return 1
             else
               return 2
             fi
           }
           
-          # 确定要更新的目标版本
+          # 初始化变量
           TARGET_TAG=""
           TARGET_DOWNLOAD=""
           UPDATE_REASON=""
+          UPDATE_NEEDED="false"
+          
+          echo "比较版本..."
+          echo "本地版本: $LOCAL_VERSION"
+          echo "最新正式版: $LATEST_TAG"
+          echo "最新Pre-release: $PRE_TAG"
           
           # 手动更新Latest的情况
-          if [ "${{ github.event.inputs.update_latest == 'true' }}" = "true" ] && [ -n "$LATEST_TAG" ]; then
+          if [ "${{ github.event.inputs.update_latest }}" = "true" ] && [ -n "$LATEST_TAG" ]; then
             TARGET_TAG="$LATEST_TAG"
             TARGET_DOWNLOAD="$LATEST_DOWNLOAD"
             UPDATE_REASON="manual_latest"
+            UPDATE_NEEDED="true"
             echo "手动选择更新到 Latest: $LATEST_TAG"
           
           # 自动更新逻辑
           else
-            # 比较本地版本与最新正式版
-            compare_versions "$LOCAL_VERSION" "$LATEST_TAG"
-            local_vs_latest=$?
+            # 检查最新正式版
+            if [ -n "$LATEST_TAG" ] && [ "$LOCAL_VERSION" != "$LATEST_TAG" ]; then
+              compare_versions "$LOCAL_VERSION" "$LATEST_TAG"
+              result=$?
+              if [ $result -eq 2 ]; then
+                TARGET_TAG="$LATEST_TAG"
+                TARGET_DOWNLOAD="$LATEST_DOWNLOAD"
+                UPDATE_REASON="newer_latest"
+                UPDATE_NEEDED="true"
+                echo "发现更新的正式版: $LATEST_TAG"
+              fi
+            fi
             
-            # 比较本地版本与最新Pre-release
-            compare_versions "$LOCAL_VERSION" "$PRE_TAG"
-            local_vs_pre=$?
-            
-            # 选择更新的目标
-            if [ -n "$LATEST_TAG" ] && [ $local_vs_latest -eq 2 ]; then
-              # 本地版本落后于最新正式版
-              TARGET_TAG="$LATEST_TAG"
-              TARGET_DOWNLOAD="$LATEST_DOWNLOAD"
-              UPDATE_REASON="newer_latest"
-              echo "发现更新的正式版: $LATEST_TAG"
-            elif [ -n "$PRE_TAG" ] && [ $local_vs_pre -eq 2 ]; then
-              # 本地版本落后于最新Pre-release
-              TARGET_TAG="$PRE_TAG"
-              TARGET_DOWNLOAD="$PRE_DOWNLOAD"
-              UPDATE_REASON="newer_pre"
-              echo "发现更新的Pre-release: $PRE_TAG"
-            else
-              echo "当前已是最新版本，无需更新"
+            # 如果没有正式版更新，检查Pre-release
+            if [ "$UPDATE_NEEDED" = "false" ] && [ -n "$PRE_TAG" ] && [ "$LOCAL_VERSION" != "$PRE_TAG" ]; then
+              compare_versions "$LOCAL_VERSION" "$PRE_TAG"
+              result=$?
+              if [ $result -eq 2 ]; then
+                TARGET_TAG="$PRE_TAG"
+                TARGET_DOWNLOAD="$PRE_DOWNLOAD"
+                UPDATE_REASON="newer_pre"
+                UPDATE_NEEDED="true"
+                echo "发现更新的Pre-release: $PRE_TAG"
+              fi
             fi
           fi
           
+          # 设置环境变量
           echo "TARGET_TAG=$TARGET_TAG" >> $GITHUB_ENV
           echo "TARGET_DOWNLOAD=$TARGET_DOWNLOAD" >> $GITHUB_ENV
           echo "UPDATE_REASON=$UPDATE_REASON" >> $GITHUB_ENV
+          echo "UPDATE_NEEDED=$UPDATE_NEEDED" >> $GITHUB_ENV
+          
+          if [ "$UPDATE_NEEDED" = "true" ]; then
+            echo "需要更新到: $TARGET_TAG"
+          else
+            echo "当前已是最新版本，无需更新"
+          fi
 
       - name: 执行更新
-        if: env.TARGET_TAG != ''
+        if: env.UPDATE_NEEDED == 'true'
         run: |
           echo "开始更新到版本: $TARGET_TAG"
           echo "下载链接: $TARGET_DOWNLOAD"
           
+          # 检查下载链接是否有效
+          if [ -z "$TARGET_DOWNLOAD" ]; then
+            echo "错误: 下载链接为空"
+            exit 1
+          fi
+          
           # 清理当前目录（保留.git）
-          shopt -s extglob
-          rm -rf !(.git)
+          find . -maxdepth 1 ! -name '.git' ! -name '.' -exec rm -rf {} + 2>/dev/null || true
           
           # 下载并解压新版本
-          wget -O worker.zip "$TARGET_DOWNLOAD"
-          unzip -o worker.zip
-          rm worker.zip
+          echo "下载worker.zip..."
+          wget -q --show-progress -O worker.zip "$TARGET_DOWNLOAD"
+          
+          if [ ! -f worker.zip ]; then
+            echo "错误: 下载失败"
+            exit 1
+          fi
+          
+          echo "解压文件..."
+          unzip -q -o worker.zip
+          rm -f worker.zip
           
           # 更新版本记录
           echo "$TARGET_TAG" > version.txt
           
-          echo "更新完成: $LOCAL_VERSION -> $TARGET_TAG"
+          echo "✅ 更新完成: $LOCAL_VERSION -> $TARGET_TAG"
 
       - name: 提交更新
-        if: env.TARGET_TAG != ''
+        if: env.UPDATE_NEEDED == 'true'
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: |
-            ${{ env.UPDATE_REASON == 'manual_latest' && format('🔄 手动更新 Latest Worker：{0}', env.TARGET_TAG) || '' }}
-            ${{ env.UPDATE_REASON == 'newer_latest' && format('🔄 自动更新 Latest Worker：{0}', env.TARGET_TAG) || '' }}
-            ${{ env.UPDATE_REASON == 'newer_pre' && format('🔄 自动更新 Pre-release Worker：{0}', env.TARGET_TAG) || '' }}
+            🔄 自动更新 Worker
+            版本: ${{ env.TARGET_TAG }}
+            类型: ${{ env.UPDATE_REASON == 'manual_latest' && '手动Latest' : (env.UPDATE_REASON == 'newer_latest' && '自动Latest' : '自动Pre-release') }}
           commit_author: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
-          push_options: --force
 
       - name: 无需更新提示
-        if: env.TARGET_TAG == ''
+        if: env.UPDATE_NEEDED != 'true'
         run: |
           echo "✅ 当前已是最新版本，无需更新"
           echo "本地版本: $LOCAL_VERSION"
