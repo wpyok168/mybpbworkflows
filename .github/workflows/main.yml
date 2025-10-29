@@ -1,0 +1,238 @@
+name: Auto Update Worker
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "0 1 * * *" # 每天凌晨1点自动运行
+  workflow_dispatch:
+    inputs:
+      update_latest:
+        description: '是否手动更新 Latest 正式版？'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 初始化仓库
+        uses: actions/checkout@v4
+
+      - name: 安装必要工具
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: 获取当前本地版本
+        id: local_version
+        run: |
+          if [ -f version.txt ]; then
+            LOCAL_VERSION=$(cat version.txt)
+            echo "LOCAL_VERSION=$LOCAL_VERSION" >> $GITHUB_ENV
+          else
+            echo "LOCAL_VERSION=v0.0.0" >> $GITHUB_ENV
+          fi
+          echo "当前本地版本: $LOCAL_VERSION"
+
+      - name: 获取所有发布版本信息
+        id: get_releases
+        run: |
+          set -e  # 遇到错误立即退出
+          echo "获取发布版本信息..."
+          API_URL="https://api.github.com/repos/bia-pain-bache/BPB-Worker-Panel/releases"
+          RESPONSE=$(curl -s -f "$API_URL")
+          
+          if [ $? -ne 0 ]; then
+            echo "错误: 无法获取发布信息"
+            exit 1
+          fi
+          
+          # 检查响应是否为空
+          if [ -z "$RESPONSE" ] || [ "$RESPONSE" = "[]" ]; then
+            echo "警告: 没有找到任何发布版本"
+            echo "LATEST_TAG=" >> $GITHUB_ENV
+            echo "LATEST_DOWNLOAD=" >> $GITHUB_ENV
+            echo "PRE_TAG=" >> $GITHUB_ENV
+            echo "PRE_DOWNLOAD=" >> $GITHUB_ENV
+            exit 0
+          fi
+          
+          echo "API响应前100字符: ${RESPONSE:0:100}"
+          
+          # 获取最新正式版
+          LATEST_RELEASE=$(echo "$RESPONSE" | jq -r '[.[] | select(.prerelease==false)][0] // "null"')
+          if [ "$LATEST_RELEASE" != "null" ] && [ "$LATEST_RELEASE" != "null" ]; then
+            LATEST_TAG=$(echo "$LATEST_RELEASE" | jq -r '.tag_name // ""')
+            LATEST_DOWNLOAD=$(echo "$LATEST_RELEASE" | jq -r '.assets[]? | select(.name=="worker.zip") | .browser_download_url // ""')
+          else
+            LATEST_TAG=""
+            LATEST_DOWNLOAD=""
+          fi
+          
+          # 获取最新Pre-release
+          PRE_RELEASE=$(echo "$RESPONSE" | jq -r '[.[] | select(.prerelease==true)][0] // "null"')
+          if [ "$PRE_RELEASE" != "null" ] && [ "$PRE_RELEASE" != "null" ]; then
+            PRE_TAG=$(echo "$PRE_RELEASE" | jq -r '.tag_name // ""')
+            PRE_DOWNLOAD=$(echo "$PRE_RELEASE" | jq -r '.assets[]? | select(.name=="worker.zip") | .browser_download_url // ""')
+          else
+            PRE_TAG=""
+            PRE_DOWNLOAD=""
+          fi
+          
+          echo "LATEST_TAG=$LATEST_TAG" >> $GITHUB_ENV
+          echo "LATEST_DOWNLOAD=$LATEST_DOWNLOAD" >> $GITHUB_ENV
+          echo "PRE_TAG=$PRE_TAG" >> $GITHUB_ENV
+          echo "PRE_DOWNLOAD=$PRE_DOWNLOAD" >> $GITHUB_ENV
+          
+          echo "最新正式版: $LATEST_TAG"
+          echo "最新Pre-release: $PRE_TAG"
+
+      - name: 版本比较和选择更新目标
+        id: select_target
+        run: |
+          set -e  # 遇到错误立即退出
+          
+          # 初始化变量
+          TARGET_TAG=""
+          TARGET_DOWNLOAD=""
+          UPDATE_REASON=""
+          UPDATE_NEEDED="false"
+          
+          echo "比较版本..."
+          echo "本地版本: $LOCAL_VERSION"
+          echo "最新正式版: $LATEST_TAG"
+          echo "最新Pre-release: $PRE_TAG"
+          
+          # 手动更新Latest的情况
+          if [ "${{ github.event.inputs.update_latest }}" = "true" ] && [ -n "$LATEST_TAG" ]; then
+            TARGET_TAG="$LATEST_TAG"
+            TARGET_DOWNLOAD="$LATEST_DOWNLOAD"
+            UPDATE_REASON="manual_latest"
+            UPDATE_NEEDED="true"
+            echo "手动选择更新到 Latest: $LATEST_TAG"
+          
+          # 自动更新逻辑
+          else
+            # 检查最新正式版
+            if [ -n "$LATEST_TAG" ] && [ "$LOCAL_VERSION" != "$LATEST_TAG" ]; then
+              # 简化版本比较：直接使用字符串比较
+              if [[ "$LATEST_TAG" > "$LOCAL_VERSION" ]] || [[ "$LOCAL_VERSION" == "v0.0.0" ]]; then
+                TARGET_TAG="$LATEST_TAG"
+                TARGET_DOWNLOAD="$LATEST_DOWNLOAD"
+                UPDATE_REASON="newer_latest"
+                UPDATE_NEEDED="true"
+                echo "发现更新的正式版: $LATEST_TAG"
+              fi
+            fi
+            
+            # 如果没有正式版更新，检查Pre-release
+            if [ "$UPDATE_NEEDED" = "false" ] && [ -n "$PRE_TAG" ] && [ "$LOCAL_VERSION" != "$PRE_TAG" ]; then
+              if [[ "$PRE_TAG" > "$LOCAL_VERSION" ]] || [[ "$LOCAL_VERSION" == "v0.0.0" ]]; then
+                TARGET_TAG="$PRE_TAG"
+                TARGET_DOWNLOAD="$PRE_DOWNLOAD"
+                UPDATE_REASON="newer_pre"
+                UPDATE_NEEDED="true"
+                echo "发现更新的Pre-release: $PRE_TAG"
+              fi
+            fi
+          fi
+          
+          # 设置环境变量
+          echo "TARGET_TAG=$TARGET_TAG" >> $GITHUB_ENV
+          echo "TARGET_DOWNLOAD=$TARGET_DOWNLOAD" >> $GITHUB_ENV
+          echo "UPDATE_REASON=$UPDATE_REASON" >> $GITHUB_ENV
+          echo "UPDATE_NEEDED=$UPDATE_NEEDED" >> $GITHUB_ENV
+          
+          if [ "$UPDATE_NEEDED" = "true" ]; then
+            echo "需要更新到: $TARGET_TAG"
+          else
+            echo "当前已是最新版本，无需更新"
+          fi
+
+      - name: 生成提交信息
+        if: env.UPDATE_NEEDED == 'true'
+        id: commit_msg
+        run: |
+          case "$UPDATE_REASON" in
+            "manual_latest")
+              COMMIT_TYPE="手动Latest"
+              ;;
+            "newer_latest")
+              COMMIT_TYPE="自动Latest"
+              ;;
+            "newer_pre")
+              COMMIT_TYPE="自动Pre-release"
+              ;;
+            *)
+              COMMIT_TYPE="自动更新"
+              ;;
+          esac
+          
+          # 创建提交信息
+          COMMIT_MESSAGE="🔄 自动更新 Worker
+版本: $TARGET_TAG
+类型: $COMMIT_TYPE"
+          
+          # 设置输出 - 使用单行方式
+          echo "commit_message=$COMMIT_MESSAGE" >> $GITHUB_OUTPUT
+
+      - name: 执行更新
+        if: env.UPDATE_NEEDED == 'true'
+        run: |
+          set -e  # 遇到错误立即退出
+          echo "开始更新到版本: $TARGET_TAG"
+          echo "下载链接: $TARGET_DOWNLOAD"
+          
+          # 检查下载链接是否有效
+          if [ -z "$TARGET_DOWNLOAD" ]; then
+            echo "错误: 下载链接为空"
+            exit 1
+          fi
+          
+          # 清理当前目录（保留.git）
+          echo "清理当前目录..."
+          find . -maxdepth 1 ! -name '.git' ! -name '.' ! -name 'version.txt' -exec rm -rf {} + 2>/dev/null || true
+          
+          # 下载并解压新版本
+          echo "下载worker.zip..."
+          if ! wget --progress=dot:giga -O worker.zip "$TARGET_DOWNLOAD"; then
+            echo "错误: 下载失败"
+            exit 1
+          fi
+          
+          if [ ! -f worker.zip ]; then
+            echo "错误: 下载文件不存在"
+            exit 1
+          fi
+          
+          echo "解压文件..."
+          if ! unzip -q -o worker.zip; then
+            echo "错误: 解压失败"
+            exit 1
+          fi
+          rm -f worker.zip
+          
+          # 更新版本记录
+          echo "$TARGET_TAG" > version.txt
+          
+          echo "✅ 更新完成: $LOCAL_VERSION -> $TARGET_TAG"
+
+      - name: 提交更新
+        if: env.UPDATE_NEEDED == 'true'
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: ${{ steps.commit_msg.outputs.commit_message }}
+          commit_author: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
+
+      - name: 无需更新提示
+        if: env.UPDATE_NEEDED != 'true'
+        run: |
+          echo "✅ 当前已是最新版本，无需更新"
+          echo "本地版本: $LOCAL_VERSION"
+          echo "最新正式版: $LATEST_TAG"
+          echo "最新Pre-release: $PRE_TAG"
