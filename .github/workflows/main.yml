@@ -23,6 +23,11 @@ jobs:
       - name: 初始化仓库
         uses: actions/checkout@v4
 
+      - name: 安装必要工具
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
       - name: 获取当前本地版本
         id: local_version
         run: |
@@ -37,16 +42,31 @@ jobs:
       - name: 获取所有发布版本信息
         id: get_releases
         run: |
+          set -e  # 遇到错误立即退出
+          echo "获取发布版本信息..."
           API_URL="https://api.github.com/repos/bia-pain-bache/BPB-Worker-Panel/releases"
-          RESPONSE=$(curl -s "$API_URL")
+          RESPONSE=$(curl -s -f "$API_URL")
           
-          # 调试输出
-          echo "API响应:"
-          echo "$RESPONSE" | jq .[] | head -20
+          if [ $? -ne 0 ]; then
+            echo "错误: 无法获取发布信息"
+            exit 1
+          fi
+          
+          # 检查响应是否为空
+          if [ -z "$RESPONSE" ] || [ "$RESPONSE" = "[]" ]; then
+            echo "警告: 没有找到任何发布版本"
+            echo "LATEST_TAG=" >> $GITHUB_ENV
+            echo "LATEST_DOWNLOAD=" >> $GITHUB_ENV
+            echo "PRE_TAG=" >> $GITHUB_ENV
+            echo "PRE_DOWNLOAD=" >> $GITHUB_ENV
+            exit 0
+          fi
+          
+          echo "API响应前100字符: ${RESPONSE:0:100}"
           
           # 获取最新正式版
           LATEST_RELEASE=$(echo "$RESPONSE" | jq -r '[.[] | select(.prerelease==false)][0] // "null"')
-          if [ "$LATEST_RELEASE" != "null" ]; then
+          if [ "$LATEST_RELEASE" != "null" ] && [ "$LATEST_RELEASE" != "null" ]; then
             LATEST_TAG=$(echo "$LATEST_RELEASE" | jq -r '.tag_name // ""')
             LATEST_DOWNLOAD=$(echo "$LATEST_RELEASE" | jq -r '.assets[]? | select(.name=="worker.zip") | .browser_download_url // ""')
           else
@@ -56,7 +76,7 @@ jobs:
           
           # 获取最新Pre-release
           PRE_RELEASE=$(echo "$RESPONSE" | jq -r '[.[] | select(.prerelease==true)][0] // "null"')
-          if [ "$PRE_RELEASE" != "null" ]; then
+          if [ "$PRE_RELEASE" != "null" ] && [ "$PRE_RELEASE" != "null" ]; then
             PRE_TAG=$(echo "$PRE_RELEASE" | jq -r '.tag_name // ""')
             PRE_DOWNLOAD=$(echo "$PRE_RELEASE" | jq -r '.assets[]? | select(.name=="worker.zip") | .browser_download_url // ""')
           else
@@ -75,20 +95,7 @@ jobs:
       - name: 版本比较和选择更新目标
         id: select_target
         run: |
-          # 简化版本比较函数
-          compare_versions() {
-            if [ "$1" = "$2" ]; then
-              return 0
-            fi
-            
-            # 使用sort进行版本比较
-            higher_version=$(echo -e "$1\n$2" | sed 's/^v//' | sort -V -r | head -n1 | sed 's/^/v/')
-            if [ "$1" = "$higher_version" ]; then
-              return 1
-            else
-              return 2
-            fi
-          }
+          set -e  # 遇到错误立即退出
           
           # 初始化变量
           TARGET_TAG=""
@@ -113,9 +120,8 @@ jobs:
           else
             # 检查最新正式版
             if [ -n "$LATEST_TAG" ] && [ "$LOCAL_VERSION" != "$LATEST_TAG" ]; then
-              compare_versions "$LOCAL_VERSION" "$LATEST_TAG"
-              result=$?
-              if [ $result -eq 2 ]; then
+              # 简化版本比较：直接使用字符串比较
+              if [[ "$LATEST_TAG" > "$LOCAL_VERSION" ]] || [[ "$LOCAL_VERSION" == "v0.0.0" ]]; then
                 TARGET_TAG="$LATEST_TAG"
                 TARGET_DOWNLOAD="$LATEST_DOWNLOAD"
                 UPDATE_REASON="newer_latest"
@@ -126,9 +132,7 @@ jobs:
             
             # 如果没有正式版更新，检查Pre-release
             if [ "$UPDATE_NEEDED" = "false" ] && [ -n "$PRE_TAG" ] && [ "$LOCAL_VERSION" != "$PRE_TAG" ]; then
-              compare_versions "$LOCAL_VERSION" "$PRE_TAG"
-              result=$?
-              if [ $result -eq 2 ]; then
+              if [[ "$PRE_TAG" > "$LOCAL_VERSION" ]] || [[ "$LOCAL_VERSION" == "v0.0.0" ]]; then
                 TARGET_TAG="$PRE_TAG"
                 TARGET_DOWNLOAD="$PRE_DOWNLOAD"
                 UPDATE_REASON="newer_pre"
@@ -152,27 +156,32 @@ jobs:
 
       - name: 生成提交信息
         if: env.UPDATE_NEEDED == 'true'
-        id: commit_message
+        id: commit_msg
         run: |
-          COMMIT_MESSAGE="🔄 自动更新 Worker\n版本: $TARGET_TAG\n类型: "
           case "$UPDATE_REASON" in
             "manual_latest")
-              COMMIT_MESSAGE="${COMMIT_MESSAGE}手动Latest"
+              COMMIT_TYPE="手动Latest"
               ;;
             "newer_latest")
-              COMMIT_MESSAGE="${COMMIT_MESSAGE}自动Latest"
+              COMMIT_TYPE="自动Latest"
               ;;
             "newer_pre")
-              COMMIT_MESSAGE="${COMMIT_MESSAGE}自动Pre-release"
+              COMMIT_TYPE="自动Pre-release"
+              ;;
+            *)
+              COMMIT_TYPE="自动更新"
               ;;
           esac
-          echo "COMMIT_MESSAGE<<EOF" >> $GITHUB_ENV
-          echo -e "$COMMIT_MESSAGE" >> $GITHUB_ENV
-          echo "EOF" >> $GITHUB_ENV
+          
+          # 使用GITHUB_OUTPUT设置输出
+          echo "commit_message=🔄 自动更新 Worker
+版本: $TARGET_TAG
+类型: $COMMIT_TYPE" >> $GITHUB_OUTPUT
 
       - name: 执行更新
         if: env.UPDATE_NEEDED == 'true'
         run: |
+          set -e  # 遇到错误立即退出
           echo "开始更新到版本: $TARGET_TAG"
           echo "下载链接: $TARGET_DOWNLOAD"
           
@@ -183,19 +192,26 @@ jobs:
           fi
           
           # 清理当前目录（保留.git）
-          find . -maxdepth 1 ! -name '.git' ! -name '.' -exec rm -rf {} + 2>/dev/null || true
+          echo "清理当前目录..."
+          find . -maxdepth 1 ! -name '.git' ! -name '.' ! -name 'version.txt' -exec rm -rf {} + 2>/dev/null || true
           
           # 下载并解压新版本
           echo "下载worker.zip..."
-          wget -q --show-progress -O worker.zip "$TARGET_DOWNLOAD"
-          
-          if [ ! -f worker.zip ]; then
+          if ! wget --progress=dot:giga -O worker.zip "$TARGET_DOWNLOAD"; then
             echo "错误: 下载失败"
             exit 1
           fi
           
+          if [ ! -f worker.zip ]; then
+            echo "错误: 下载文件不存在"
+            exit 1
+          fi
+          
           echo "解压文件..."
-          unzip -q -o worker.zip
+          if ! unzip -q -o worker.zip; then
+            echo "错误: 解压失败"
+            exit 1
+          fi
           rm -f worker.zip
           
           # 更新版本记录
@@ -207,7 +223,7 @@ jobs:
         if: env.UPDATE_NEEDED == 'true'
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: ${{ env.COMMIT_MESSAGE }}
+          commit_message: ${{ steps.commit_msg.outputs.commit_message }}
           commit_author: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
 
       - name: 无需更新提示
