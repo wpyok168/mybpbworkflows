@@ -150,6 +150,26 @@ jobs:
             echo "当前已是最新版本，无需更新"
           fi
 
+      - name: 生成提交信息
+        if: env.UPDATE_NEEDED == 'true'
+        id: commit_message
+        run: |
+          COMMIT_MESSAGE="🔄 自动更新 Worker\n版本: $TARGET_TAG\n类型: "
+          case "$UPDATE_REASON" in
+            "manual_latest")
+              COMMIT_MESSAGE="${COMMIT_MESSAGE}手动Latest"
+              ;;
+            "newer_latest")
+              COMMIT_MESSAGE="${COMMIT_MESSAGE}自动Latest"
+              ;;
+            "newer_pre")
+              COMMIT_MESSAGE="${COMMIT_MESSAGE}自动Pre-release"
+              ;;
+          esac
+          echo "COMMIT_MESSAGE<<EOF" >> $GITHUB_ENV
+          echo -e "$COMMIT_MESSAGE" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
       - name: 执行更新
         if: env.UPDATE_NEEDED == 'true'
         run: |
@@ -187,10 +207,7 @@ jobs:
         if: env.UPDATE_NEEDED == 'true'
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: |
-            🔄 自动更新 Worker
-            版本: ${{ env.TARGET_TAG }}
-            类型: ${{ env.UPDATE_REASON == 'manual_latest' && '手动Latest' : (env.UPDATE_REASON == 'newer_latest' && '自动Latest' : '自动Pre-release') }}
+          commit_message: ${{ env.COMMIT_MESSAGE }}
           commit_author: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
 
       - name: 无需更新提示
